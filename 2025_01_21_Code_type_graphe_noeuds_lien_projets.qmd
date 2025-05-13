@@ -1,0 +1,679 @@
+---
+title: "Graphe noeuds lien entre projets"
+author: "US 1502 - Unité de service d'appui aux PEPR (INRAE)"
+format: html
+editor: visual
+---
+
+## I/ Librairies
+
+```{r}
+#| echo: false
+
+# Ouvrir / enregistrer fichiers Excel
+library(readxl)
+library(writexl)
+
+# Graphes
+library(plyr)
+library(igraph)
+library(purrr)
+library(stringr)
+library(visNetwork)
+library(htmltools)
+library(stringr)
+```
+
+## II/ Fonctions
+
+### 1) Préparation dataset
+
+#### Liste unique mots
+
+```{r}
+# On veut une liste unique des mots liant les noeuds et non plusieurs mots avec des ";"
+list_lien <- function(df, x){
+  
+  # On sépare les mots par le ;
+  list_lien <- unlist(strsplit(df[[x]], " ;"))
+  # On enlève l'espace
+  list_lien <- str_trim(list_lien, "left")
+  # On met dans l'ordre alphabétique
+  list_lien <- unique(sort(list_lien))
+  print("La liste des mots pour les liens est :")
+  print(list_lien)
+  
+  return(list_lien)
+}
+```
+
+#### Enlever doublons et mise en forme des mots
+
+```{r}
+# On met tous les mots-clés dans une même colonne séparés par des ";"
+mise_forme_mots <- function(df,x){
+  
+  # On créé une nouvelle colonne
+  df$Tous_mots <- ""
+  
+  for (i in 1:nrow(df)){
+    # On prend que les mots d'une ligne des colonnes qui nous intéressent
+    mots <- unlist(df[i,c(x)])
+    # On enlève les NA
+    mots <- mots[!is.na(mots)]
+    # On sépare bien les variables par des ;
+    mots <- paste(mots,collapse = ' ; ')
+    # On retrouve tous les mots
+    mots <- stringr::str_split_1(mots, " ; ")
+    # Et on enlève les doublons
+    mots <- unique(mots)
+    # On met enfin tous les mots ensemble
+    if (length(mots)>0){
+      df$Tous_mots[i] <- paste(mots,collapse = ' ; ')
+    }else{
+      df$Tous_mots[i] <- NA
+    }
+  }
+  
+  return(df$Tous_mots)
+}
+```
+
+#### Ajout mots aux mots clés
+
+Sur le dataframe "2024_08_19_Liste_des_mots_clés_et_mots_des_titres", on trouve les "mots - propres" ajoutés en plus des "mots brutes" des projets
+
+```{r}
+# Pour 1 mot, on rajoute les mots qui correspondent :
+ajout_mot_propre_au_brut <- function(df_mot, mot_j, i){
+  print("mot ====== ")
+  print(mot_j[i])
+  mots_plus <- df_mot$`Mots - propres`[which(df_mot$`Mots brutes` == mot_j[i])]
+  print("mots_plus ====== ")
+  print(mots_plus)
+  if (is.na(mots_plus) == TRUE){
+    print(paste("Erreur pour ", mot_j))
+  }
+  # On sépare bien les mots
+  mots_plus <- stringr::str_split_1(mots_plus, " ; ")
+  
+  return(mots_plus)
+}
+# Test :
+# mots <- unlist(df[27, num_colonne])
+# # On retrouve tous les mots du lien choisi
+# mots <- stringr::str_split_1(mots, " ; ")
+# print(mots)
+# mots_test <- ajout_mot_propre_au_brut(df_mots, mots, 1)
+# print(mots_test)
+```
+
+```{r}
+# Pour chaque projet et chaque colonne (mots clés / mots titres ou les 2), 
+# on rajoute tous les mots
+rajout_mots_1_projet_1_col <- function(df_mots,df,num_col,col_new_mots){
+  
+  # Pour chaque groupe de mots de la colonne num_col de la ligne k, 
+  # on y ajoute tous les mots associés
+  for (k in 1:nrow(df)){
+    print(paste("k is ",k, " -------------------------------------"))
+    
+    # On prend que les mots d'une ligne des colonnes qui nous intéressent
+    mots <- unlist(df[k, num_col])
+    # On retrouve tous les mots du lien choisi
+    mots <- stringr::str_split_1(mots, " ; ")
+    #print(mots)
+    
+    # Pour les mots d'un même lien d'un même projet, on trouve les autres mots liés
+    mots_propre <- sapply(1:length(mots), function(j){
+      ajout_mot_propre_au_brut(df_mots, mots, j)
+    })
+    mots_propre <- unlist(mots_propre)
+    mots_propre <- unique(mots_propre)
+    print(mots_propre)
+    # On enlève les NA
+    mots_propre <- mots_propre[!is.na(mots_propre)]
+    # On sépare bien les variables par des ;
+    mots_propre<- paste(mots_propre,collapse = ' ; ')
+    print(mots_propre)
+    # Et on les ajoute dans la colonne correspondante
+    df[[as.character(col_new_mots)]][k] <- mots_propre
+    
+  }
+  
+  return(df)
+}
+```
+
+### 2) Ouverture dataset complet
+
+```{r}
+# Mise en forme du dataframe
+mise_en_forme <- function(df){
+
+  # On renomme en la colonne id
+  names(df)[1] <- "id"
+
+  ### Mise en forme du dataframe
+  # On change les modalités qui posent problème
+  df[df$Ecosystème=="Non spécifique",]$Ecosystème <- "Non_spécifique"
+  df[df$Ecosystème=="Tempérés et tropicaux",]$Ecosystème <- "Tempérés_et_tropicaux"
+  df[df$`Etablissement coordinateur`=="Montpellier BS",]$`Etablissement coordinateur` <- "Montpellier_BS"
+
+  return(df)
+}
+```
+
+
+### 3) Préparation du network
+
+```{r}
+# Création dataframe link
+dataframe_link <- function(df, liste_tous_mots, x){
+  
+  ### On créé un dataframe avec toutes les combinaisons possibles
+  link <- expand.grid(Noeud1 = unique(df$id), Noeud2 = unique(df$id))
+  # On ne veut pas les combinaisons de 2 fois la même unité
+  link <- link[link$Noeud1!=link$Noeud2,]
+  
+  # On convertie les mots de chaque projet en liste
+  df[[x]] <- strsplit(df[[x]], " ; ")
+  # Transformer chaque liste en un vecteur unique
+  df[[x]] <- lapply(df[[x]], unlist)
+  
+  ### Pour chaque combinaison possible, on regarde s'il y a lien ou non
+  # On initie la variable lien 
+  link$Lien <- 0
+  # Pour chaque mot clé/défi/lien... :
+  for (p in liste_tous_mots){
+    
+    #print(paste("p is ",p," -------------------"))
+    
+    # On a une liste des noeuds ayant pris part au défi/mot clé/lien...
+    liste_noeuds = lapply(1:nrow(df), function(i){
+      if (p %in% df[[x]][[i]]){
+        return(df$id[i])
+      }
+    })
+    liste_noeuds <- unlist(liste_noeuds)
+    
+    # Pour chaque noeud qui a ce lien
+    for (i in 1:length(link$Noeud1)){
+      
+      # Si les 2 noeuds font parties du même projet :
+      if ((link$Noeud1[i] %in% liste_noeuds) && (link$Noeud2[i] %in% liste_noeuds)){
+        # Ces 2 noeuds ont donc collaborées
+        link$Lien[i] <- link$Lien[i] + 1
+      }
+    }
+    
+  }
+  
+  return(link)
+  
+}
+
+# test
+data_link <- dataframe_link(df = data, 
+                            liste_tous_mots = liste_mots,
+                            x = lien_choisi)
+```
+
+```{r}
+# Création de la matrice des liens pour le network PNG
+mat_link <- function(link){
+  
+  link$Noeud1 <- as.character(link$Noeud1)
+  link$Noeud2 <- as.character(link$Noeud2)
+  link$Lien <- as.integer(link$Lien)
+  
+  # On créé la matrice en utilisant tous les noms uniques de Noeud1 et Noeud2
+  nodes <- unique(c(link$Noeud1, link$Noeud2))
+  mat = matrix(0, ncol=length(nodes), nrow=length(nodes))
+  colnames(mat) = nodes
+  row.names(mat) = nodes
+  
+  # On y assigne les valeurs
+  for(i in 1:nrow(link)){
+    node1 <- link$Noeud1[i]
+    node2 <- link$Noeud2[i]
+    value <- link$Lien[i]
+    
+    # Remplir la matrice aux deux positions pour rendre la matrice symétrique
+    mat[node1, node2] <- value
+    mat[node2, node1] <- value
+  }
+  
+  return(mat)
+}
+```
+
+
+### 4) Création network PNG
+
+```{r}
+plot_network_png <- function(mat, x){
+  
+  graph=graph_from_adjacency_matrix(mat, mode = c("undirected"), weighted=T)
+  graph=simplify(graph)
+  sizes_mat=rowSums(mat)/10
+  W1=edge_attr(graph)$weight
+  
+  plot.igraph(graph,
+              vertex.size=sizes_mat,
+              edge.size=W1,
+              edge.color="grey80", # couleur des ponts (traits)
+              vertex.color= "lightcyan", # couleur des cercles (intérieur)
+              vertex.frame.color= "black", # couleur des cercles (contour)
+              vertex.label.color = "black", # couleurs des labels
+              main = paste("Interactions par les",x,"entre les projets reçus lors de l’Appel à Manifestation d’Intérêt de FORESTT"),
+              margin=c(0,0,0,0))
+  
+}
+```
+
+
+### 5) Création network HTML
+
+#### Dataframe lien
+
+```{r}
+dataframe_links <- function(df_link){
+  
+  df_links <- data.frame(from=df_link[,1], to=df_link[,2], Lien=df_link[,3])
+  df_links$Lien <- as.numeric(df_links$Lien)
+  # On enlève les liens quand il n'y a rien en commun
+  df_links <- df_links[df_links$Lien != 0,]
+  
+  return(df_links)
+}
+
+```
+
+#### Préparation des couleurs
+
+```{r}
+group_couleur <- function(y){
+  
+  if (y == "Ecosystème"){
+    
+    group_colors_df <- list(
+      Non_spécifique = list(background = "lightblue", border = "black"), #"Non spécifique"
+      Tempérés = list(background = "pink", border = "black"),
+      Tempérés_et_tropicaux = list(background = "lightgreen", border = "black"),
+      Tropicaux = list(background = "gold", border = "black")
+    )
+    
+  }
+  
+  if (y == "Etablissement coordinateur") {
+    
+    group_colors_df <- list(
+      AgroParisTech = list(background = "#d49d64", border = "black"),
+      CIRAD = list(background = "pink", border = "black"),
+      CNPF = list(background = "gold", border = "black"),
+      CNRS = list(background = "darkorange", border = "black"),
+      INRAE = list(background = "lightblue", border = "black"),
+      IRD = list(background = "lightgreen", border = "black"),
+      MNHN = list(background = "magenta", border = "black"),
+      Montpellier_BS = list(background = "thistle", border = "black"),
+      Universités = list(background = "seashell", border = "black")
+    )
+    
+  }
+  return(group_colors_df)
+}
+```
+
+```{r}
+# Fonction pour attribuer des couleurs selon les groupes
+node_colors <- function(group) {
+  # On associe au groupe une couleur
+  color <- group_colors[[group]]
+  # S'il n'y a pas de couleur correspondante, on en met 1 par défaut
+  if (is.null(color)) {
+    color <- list(background = "gray", border = "black")
+  }
+  return(color)
+}
+```
+
+#### Création du network
+
+```{r}
+graphe_network_html <- function(x,y){
+  
+  if (y == "Ecosystème"){
+    
+    ### Titre et chargement des données
+    graph <- visNetwork(vis.nodes, vis.links, width = "100%", 
+               main = paste("Interactions par les",x,"entre les projets reçus lors de l’Appel à Manifestation d’Intérêt de FORESTT")) %>%
+      visIgraphLayout() %>%
+      
+      ### Les noeuds
+      visNodes(
+        shape = "dot",
+        shadow = list(enabled = TRUE, size = 10),
+        labelHighlightBold = TRUE,
+        color = list(highlight = "red")
+      ) %>%
+      
+      ### Les traits
+      visEdges(
+        shadow = FALSE,
+        color = list(color = "lightgray", 
+                     highlight = "red")
+      ) %>%
+      
+      ### Choix des projets ciblés
+      visOptions(
+        highlightNearest = list(enabled = TRUE, degree = 1, hover = FALSE),
+        selectedBy = list(variable = "id", multiple = TRUE,
+                          main = "Sélectionnez un projet")
+      ) %>%
+      
+      ### Couleur des groupes
+      visGroups(groupname = "Non_Spécifique", color = group_colors$Non_Spécifique) %>%
+      visGroups(groupname = "Tempérés", color = group_colors$Tempérés) %>%
+      visGroups(groupname = "Tempérés_et_tropicaux", color = group_colors$Tempérés_et_tropicaux) %>%
+      visGroups(groupname = "Tropicaux", color = group_colors$Tropicaux) %>%
+      
+      ### La légende
+      # https://rdrr.io/cran/visNetwork/man/visLegend.html
+      visLegend(enabled = TRUE,
+                width = 0.2, # Number, in [0,...,1]. Default to 0.2
+                useGroups = TRUE, # use groups options in legend ? Default to TRUE.
+                position = "left", # one of "left" (Default) or "right"
+                main = list(text = as.character(y),
+                            style = "font-family:Comic Sans MS;font-size:12px;text-align:center;"), # For add a title. Character or a named list.
+                zoom = TRUE # Boolean. Enable zoom on legend ? Default to TRUE
+      ) %>%
+      
+      ### Répartition des noeuds
+      visLayout(randomSeed = 123588)  
+  }
+  
+  if (y == "Etablissement coordinateur"){
+    
+    ### Titre et chargement des données
+    graph <- visNetwork(vis.nodes, vis.links, width = "100%", 
+               main = paste("Interactions par les",x,"entre les projets reçus lors de l’Appel à Manifestation d’Intérêt de FORESTT")) %>%
+      visIgraphLayout() %>%
+      
+      ### Les noeuds
+      visNodes(
+        shape = "dot",
+        shadow = list(enabled = TRUE, size = 10),
+        labelHighlightBold = TRUE,
+        color = list(highlight = "red")
+      ) %>%
+      
+      ### Les traits
+      visEdges(
+        shadow = FALSE,
+        color = list(color = "lightgray", 
+                     highlight = "red")
+      ) %>%
+      
+      ### Choix des projets ciblés
+      visOptions(
+        highlightNearest = list(enabled = TRUE, degree = 1, hover = FALSE),
+        selectedBy = list(variable = "id", multiple = TRUE,
+                          main = "Sélectionnez un projet")
+      ) %>%
+      
+      ### Couleur des groupes
+      visGroups(groupname = "AgroParisTech", color = group_colors$AgroParisTech) %>%
+      visGroups(groupname = "CIRAD", color = group_colors$CIRAD) %>%
+      visGroups(groupname = "CNPF", color = group_colors$CNPF) %>%
+      visGroups(groupname = "CNRS", color = group_colors$CNRS) %>%
+      visGroups(groupname = "INRAE", color = group_colors$INRAE) %>%
+      visGroups(groupname = "IRD", color = group_colors$IRD) %>%
+      visGroups(groupname = "MNHN", color = group_colors$MNHN) %>%
+      visGroups(groupname = "Montpellier_BS", color = group_colors$Montpellier_BS) %>%
+      visGroups(groupname = "Universités", color = group_colors$Universités) %>%
+
+      ### La légende
+      # https://rdrr.io/cran/visNetwork/man/visLegend.html
+      visLegend(enabled = TRUE,
+                width = 0.2, # Number, in [0,...,1]. Default to 0.2
+                useGroups = TRUE, # use groups options in legend ? Default to TRUE.
+                position = "left", # one of "left" (Default) or "right"
+                main = list(text = as.character(y),
+                            style = "font-family:Comic Sans MS;font-size:12px;text-align:center;"), # For add a title. Character or a named list.
+                zoom = TRUE # Boolean. Enable zoom on legend ? Default to TRUE
+      ) %>%
+      
+      ### Répartition des noeuds
+      visLayout(randomSeed = 123588) 
+    
+  }
+  
+  return (graph)
+}
+```
+
+```{r}
+html_explanation <- "
+<div style='font-family: Arial, sans-serif; font-size: 16px; width: 30%; float: right; margin-left: 20px;'>
+  <h3>Explication du graphe</h3>
+  <p>Voici une brève description du graphique :</p>
+  <p>Ce graphe montre les relations entre différents nœuds. Chaque connexion représente un lien entre deux éléments du réseau. Utilisez le zoom et le déplacement pour explorer les différents nœuds et leurs connexions.</p>
+</div>
+"
+```
+
+
+
+## III/ Principal
+
+### 1) Préparation dataset
+
+#### A) Ouverture du dataset incomplet (step1)
+
+```{r}
+## Le jeu de données avant ajout de mots supplémentaires
+data_brute <- readxl::read_excel("C:/Users/mjoigneau/Nextcloud/MyDrive/4_Codes_types/Graphes_noeuds_lien_projets/2025_01_20_Excel_exemple_analyse_projets_incomplet_step1.xlsx",
+                   sheet = "Projets")
+```
+
+```{r}
+## Rajout colonne "mots clés et titre", fusion unique des colonnes "mots clés" et "titre"
+# Ajout d'une nouvelle colonne par fusion de 2 colonnes
+data_new <- data_brute
+data_new$`Mots clés et titre` <- paste(data_new$`Mots clés`, data_new$`Mots titre`, sep = " ; ")
+# On enlève les mots en double
+data_new$`Mots clés et titre` <- mise_forme_mots(data_new,"Mots clés et titre")
+```
+
+#### B) Préparation dataset liste mots (step2)
+
+```{r}
+## On a une liste unique de tous les mots
+verif <- as.data.frame(list_lien(data_new,"Mots clés et titre"))
+liste_mots <- verif$`list_lien(data_new, "Mots clés et titre")`
+
+## On en fait un dataframe
+names(verif)[1] <- "Mots brutes"
+verif$Catégorie <- ""
+verif$`Mots - propres` <- ""
+
+# On enregistre
+write_xlsx(verif,
+           path = "C:/Users/mjoigneau/Nextcloud/MyDrive/4_Codes_types/Graphes_noeuds_lien_projets/2025_01_20_Excel_exemple_liste_mots_à_compléter_step2.xlsx",
+           col_names=TRUE)
+```
+
+#### C) Remplissage du dataset liste mot (step3)
+
+On doit ensuite manuellement rajouter des mots dans la colonne "Mots - propres" du fichier Excel "2025_01_20_Excel_exemple_liste_mots_tous_step3.xlsx"
+
+#### D) Finition du dataset de base par mot (step4)
+
+```{r}
+### On ouvre l'Excel
+data_mots <- read_excel("C:/Users/mjoigneau/Nextcloud/MyDrive/4_Codes_types/Graphes_noeuds_lien_projets/2025_01_20_Excel_exemple_liste_mots_tous_step3.xlsx",
+                   sheet = "Mots")
+
+### Ajout des mots supplémentaires
+list_lien <- c("Mots clés", "Mots clés et titre")
+
+for (lien_choisi in list_lien){
+  
+  # On trouve le numéro de la colonne des mots du lien choisi à compléter
+  num_colonne <- which(colnames(data_new) == lien_choisi)
+  print(num_colonne)
+  # On créé une nouvelle colonne avec les mots originaux
+  col_new_mots <- paste(lien_choisi,"- tous")
+  data_new[[as.character(col_new_mots)]] <- ""
+  
+  # En fonction des nouveaux mots associés aux mots clés/titres, on rajoute des mots sur l'Excel de base
+  data_new <- rajout_mots_1_projet_1_col(data_mots, data_new, num_colonne,col_new_mots)
+}
+
+### On enregistre
+write_xlsx(data_new,
+           path = "C:/Users/mjoigneau/Nextcloud/MyDrive/4_Codes_types/Graphes_noeuds_lien_projets/2025_01_20_Excel_exemple_analyse_projets_complet_step4.xlsx",
+           col_names=TRUE)
+```
+
+
+### 2) Ouverture dataset complet
+
+```{r}
+## Le jeu de données
+data <- readxl::read_excel("C:/Users/mjoigneau/Nextcloud/MyDrive/4_Codes_types/Graphes_noeuds_lien_projets/2025_01_20_Excel_exemple_analyse_projets_complet_step4.xlsx")
+
+## Mise en forme
+data <- mise_en_forme(data)
+```
+
+
+### 3) Préparation du network
+
+```{r}
+### Liste des 3 liens différents (mots clés, défis scientifiques et mots-clés+titres)
+lien_choisi <- "Mots clés - tous"
+#lien_choisi <- "Défis scientifiques" (ou autre variable)
+#lien_choisi = "Mots clés et titre - tous"
+
+### Les noms des colonnes ont évoluées pour les titres
+lien_choisi_titre <- "mots clés"
+#lien_choisi_titre <- "défis scientifiques" (ou autre variable)
+#lien_choisi_titre = "mots clés et titres"
+```
+
+
+#### Dataframe et matrice prêts pour networks
+
+```{r}
+### Création du dataframe link
+# Noeuds = Acronyme projets
+data_link <- dataframe_link(df = data, 
+                            liste_tous_mots = liste_mots,
+                            x = lien_choisi)
+
+### Création matrice
+matrice_link <- mat_link(data_link)
+```
+
+### 4) Network PNG
+
+```{r}
+### Graphe network
+plot_network_png(matrice_link,lien_choisi_titre)
+```
+
+### 5) Network HTML
+
+```{r}
+### Liste des 3 liens différents (mots clés, défis scientifiques et mots-clés+titres)
+lien_choisi <- "Mots clés - tous"
+#lien_choisi <- "Défis scientifiques" (ou autre variable)
+#lien_choisi = "Mots clés et titre - tous"
+
+### Les noms des colonnes ont évoluées pour les titres
+lien_choisi_titre <- "mots clés"
+#lien_choisi_titre <- "défis scientifiques" (ou autre variable)
+#lien_choisi_titre = "mots clés et titres"
+
+### Liste des groupes de couleurs (écosystèmes, établissements)
+#grp_choisi <- "Ecosystème" (ou autre variable)
+grp_choisi <- "Etablissement coordinateur"
+```
+
+```{r}
+### Noeuds
+# Finition dataframe links pour html
+data_links <- dataframe_links(data_link)
+# Dataframe des noeuds
+# Prendre les bonnes colonnes :
+#   2 : Ecosystème
+#   7 : Etablissement coordinateur
+# Trier les labels par ordre alphabétique
+if (grp_choisi == "Ecosystème"){
+  nodes <- data[,c(1,2)]
+  nodes <- nodes[order(nodes$Ecosystème), ]
+}else{
+  nodes <- data[,c(1,7)]
+  nodes <- nodes[order(nodes$`Etablissement coordinateur`), ]
+}
+
+
+# Caractéristiques générales des noeuds
+vis.nodes <- nodes
+names(vis.nodes)[2] <- "group"
+# vis.nodes$shape  <- "dot"  
+# vis.nodes$shadow <- TRUE # Nodes will drop shadow
+# ATTENTION POUR l'ORDRE CHANGE QUI IMPACTE LE NOM DES TITRES !!
+vis.nodes$title  <- paste(vis.nodes$id, " : ",data$Titre) # Node label
+vis.nodes$label  <- vis.nodes$id # Text on click
+# vis.nodes$size   <- 30 # Node size
+# vis.nodes$borderWidth <- 2 # Node border width
+
+### Liens
+# Caractéristiques générales des liens
+vis.links <- data_links
+# Filtre pour test
+# vis.links <- vis.links[vis.links$from %in% vis.nodes$id,]
+# vis.links <- vis.links[vis.links$to %in% vis.nodes$id,]
+
+
+### COuleurs des groupes
+group_colors <- group_couleur(grp_choisi)
+# Appliquer les couleurs aux noeuds
+vis.nodes <- vis.nodes %>%
+  mutate(color = map(group, node_colors))
+
+### Graphe HTML
+network <- graphe_network_html(lien_choisi_titre,grp_choisi)
+```
+
+#### A) Sans explication
+
+```{r}
+visSave(network, file = paste("C:/Users/mjoigneau/Nextcloud/MyDrive/4_Codes_types/Graphes_noeuds_lien_projets/2025_01_21_Network HTML_projets_-_",lien_choisi_titre,"(Lien)_+",grp_choisi,"(Couleur).html"))
+```
+
+#### B) Avec explication
+
+```{r}
+# Créer l'explication en HTML
+html_explanation <- "
+<div style='font-family: Arial, sans-serif; font-size: 16px; width: 10%; float: left; margin-left: 20px;'>
+  <h3>Explication du graphe</h3>
+  <p>Ce graphe montre les relations entre différents nœuds (projet). Chaque connexion représente un lien entre deux éléments du réseau. Plus deux noeuds sont proches dans l'espace, plus ils ont d'éléments en commun.</p>
+</div>
+"
+
+# Combiner le graphique visNetwork avec l'explication HTML
+html_output <- tagList(
+  div(style = "display: flex; align-items: center;", 
+      div(style = "flex: 1;", network),
+      HTML(html_explanation)
+  )
+)
+
+# Afficher le résultat dans une fenêtre HTML
+htmltools::save_html(html_output, paste("C:/Users/mjoigneau/Nextcloud/MyDrive/4_Codes_types/Graphes_noeuds_lien_projets/2025_01_21_Network HTML_projets_-_",lien_choisi_titre,"(Lien)_+",grp_choisi,"(Couleur)_avec_explication.html"))
+```
